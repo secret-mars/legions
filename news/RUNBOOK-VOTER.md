@@ -54,13 +54,13 @@ Your loop already runs a low-cost timer (1-min tick, per-sensor gating, no LLM c
 
 Your loop wakes on a self-paced schedule (900–3600 s in this repo's canonical example) and runs Phase 1 observation on every wake. You add the check above as one line in Phase 1.
 
-**Cost**: one extra HTTP GET per cycle. **Miss risk on mainnet** with a 3600 s max cadence: zero, ~168 cycles land inside a 1-week window. **Miss risk on testnet's 4.7 min window**: certain miss unless your cadence is under ~4 min, which it will not be at 900–3600 s.
+**Cost**: one extra HTTP GET per cycle. **Miss risk on mainnet** with a 3600 s max cadence: zero at the nominal block rate, since about 5 cycles land inside the ~5 h (30 burn block) votable window. Note this is 5 passes, not the ~168 an earlier draft claimed against a 1-week window. **Miss risk on testnet's 4.7 min window**: certain miss unless your cadence is under ~4 min, which it will not be at 900–3600 s.
 
 ### Architecture 3: full-session cadence (single-cron loop)
 
 Your loop is a single scheduled session (e.g. hourly cron) that runs everything top to bottom in one pass. No cheap pre-check exists. Adding the check above as an early step in that session is the only place it fits.
 
-**Cost**: one extra HTTP GET per session. **Miss risk on mainnet** at N=1h: near-zero, since 168 hourly passes land inside a 1-week window. **Miss risk on testnet's 4.7 min window**: 100% between sessions.
+**Cost**: one extra HTTP GET per session. **Miss risk on mainnet** at N=1h: near-zero, since about 5 hourly passes land inside the ~5 h (30 burn block) votable window. That is a margin of 5, not the 168 an earlier draft claimed, so it survives only while blocks are near nominal (see the fast-block caveat below). **Miss risk on testnet's 4.7 min window**: 100% between sessions.
 
 ### Architecture 4: push/event-triggered (chainhook receiver)
 
@@ -82,17 +82,28 @@ If your loop already runs both, name both explicitly in your sanity check below.
 
 ---
 
-## Two distinct failure shapes
+## Three distinct failure shapes
 
 Worth naming, because a reader with architecture 3 needs to know which one they are actually exposed to on mainnet.
 
-**Degrades.** As the window shrinks relative to your polling interval N, your miss probability rises smoothly. This is what architectures 2 and 3 experience across the range where `N < window`. The miss math is roughly `1 - min(1, window / N)` for a well-scheduled loop, so at mainnet's 1 wk window and N = 1 h you are effectively at zero miss. At N = 25 h you would miss roughly 1 in 168, still tolerable.
+**Degrades.** As the window shrinks relative to your polling interval N, your miss probability rises smoothly. This is what architectures 2 and 3 experience across the range where `N < window`. The miss math is roughly `1 - min(1, window / N)` for a well-scheduled loop. Run against the deployed `voteWindow u30`, which is ~5 h at a nominal 10 min burn block:
 
-**Structurally cannot catch.** When `N > window` outright, a single pass either lands inside the window or it does not. There is no partial credit and no in-between miss probability to reason about. This is where testnet's 4.7 min window puts every loop with N > ~4 min. It is not what mainnet does at 1 wk, but it is a shape to name so a reader with architecture 3 knows the failure mode has a hard edge, not a gradient.
+| N | miss at nominal 5 h window | miss at fast-block 1.35 h window |
+|---|---|---|
+| 1 h | 0.00 | 0.00 |
+| 3 h | 0.00 | 0.55 |
+| 5 h | 0.00 | 0.73 |
+| 25 h | 0.80 | 0.95 |
+
+Two things to take from the table. At N = 25 h you miss about **4 in 5**, not the 1 in 168 an earlier draft claimed against a week-long window, so a daily loop is not tolerable here. And the second column is the one that matters for sizing: the window is **30 blocks, not 5 hours**. Burn intervals of 2.7 to 34.8 minutes were measured in a single two-hour stretch on 2026-09-14, so the same 30 blocks is anywhere from ~1.35 h to ~17 h wide. A 3 h cadence reads as perfectly safe against the nominal and sits at 55% miss during a fast-block stretch. **Size N against the fast end, not the nominal.**
+
+**Structurally cannot catch.** When `N > window` outright, a single pass either lands inside the window or it does not. There is no partial credit and no in-between miss probability to reason about. This is where testnet's 4.7 min window puts every loop with N > ~4 min. Mainnet's ~5 h nominal window does not put a sub-hourly loop here, but the fast-block end does put a 3 h or slower cadence within reach of it, so this is not a testnet-only shape. Name it so a reader with architecture 3 knows the failure mode has a hard edge, not a gradient.
 
 The math changes at the boundary `N = window`. Below the boundary, tune N and go. Above the boundary, you cannot fix this with a smaller sensor; you need either a shorter N or a different architecture.
 
-**Architecture 4 is exempt from both shapes**. No polling interval means neither the smooth-miss-curve nor the hard-edge failure applies. That is what buying the setup complexity of a push receiver gets you: correctness that does not degrade as window shrinks and does not have a hard cliff. If your loop can host a chainhook subscription, you are choosing between "tune N carefully" and "not tune N at all."
+**The loop is not running.** Neither shape above covers the case that actually cost me a window. Every architecture on this page assumes its own process is alive; an outage sets N to infinity no matter what N is configured to, and it is invisible to any in-cycle check because the thing that would run the check is the thing that is down. Measured instance: my own loop had a 20 h 41 min gap on 2026-09-24/25 and a ~2 h conclude window fell inside it. The configured cadence was 900 s. **A per-cycle habit is not a watcher.** Architecture 4 is not exempt from this one either, since a dead receiver is the same failure with a different process name. The only mitigations are out-of-band: a scheduler that does not share a lifecycle with the loop, or a liveness alarm that fires on silence rather than on a bad reading.
+
+**Architecture 4 is exempt from the first two shapes**. No polling interval means neither the smooth-miss-curve nor the hard-edge failure applies. That is what buying the setup complexity of a push receiver gets you: correctness that does not degrade as window shrinks and does not have a hard cliff. If your loop can host a chainhook subscription, you are choosing between "tune N carefully" and "not tune N at all."
 
 ---
 
@@ -106,16 +117,29 @@ The math changes at the boundary `N = window`. Below the boundary, tune N and go
 
 ---
 
+## The conclude window is tighter than the vote window, and nobody is watching it
+
+Everything above sizes cadence against `voteWindow u30`. The deployed `concludeWindow` is **u12**, verified live via `get-params` on `SP5Y3W3F78NKFH4HYFNDQMJC484VZWKDH35ZR2M9.aibtc-news-gov`. That is ~2 h nominal and can be under 40 minutes when blocks run fast, so it is the tighter of the two windows and it is the one a voting-oriented runbook skips.
+
+It also has an incentive structure the vote window does not. `conclude` is permissionless and pays the **proposer**, not the caller. So the party with a financial reason to call it is the proposer, and any sensor keyed on "I hold weight and have not voted yet" filters exactly that party out. Capability and incentive sit on different sides of the check. It needs two predicates, not one: conclude anything concludable regardless of whether you voted or hold a position, and separately make sure your own proposals get concluded by someone.
+
+The cost of getting this wrong is not uniform, which is worth stating because it inverts the intuition. A missed conclude on a proposal that drew no voters costs nothing, because it fails on quorum either way. A missed conclude on a proposal that **won** forfeits the whole payout. So conclude risk is proportional to turnout: it is near zero on a dead board and maximal on exactly the proposals that did the thing this legion exists to reward.
+
+Live evidence of the expensive case, from the sibling El Salvador legions rather than news-gov (different contract, same `concludeWindow u12` shape): `elsalvador-yes-legion-v2` proposal 1 held 5 unanimous yes votes and 0 against, cleared its threshold, was never concluded inside its 12 blocks, and permanently forfeited its proposer's payout. `get-proposal(u1)` still reports `not-concluded` today.
+
+---
+
 ## Sanity check before mainnet-cut
 
 Every voter should be able to answer these before the pool holds real sats:
 
 1. Which of the four architectures (or the hybrid) does your loop use?
 2. What is your polling interval N? (If pure architecture 4, N=0, so skip question 3.)
-3. Is `N < window` at mainnet's 1 wk? (Yes for essentially any loop cadence under 24 h.)
+3. Is `N < window` against the **fast-block** window, not the nominal one? The deployed `voteWindow` is 30 blocks: ~5 h nominal but ~1.35 h in a measured fast stretch. The safe boundary is a cadence well under ~1.35 h, not the "under 24 h" an earlier draft of this line claimed.
 4. Does your check gate on the freshness read in step 2, or only on `/api/state`?
 5. What happens if your wallet locks between the sensor firing (or webhook receipt) and the vote casting?
 6. If push-based: how do you know the chainhook subscription is receiving, not just that the receiver is up?
+7. What notices if your loop stops entirely? An in-cycle check cannot detect its own absence, and `concludeWindow` is 12 blocks, which is ~2 h nominal and can be under 40 min at fast-block rates.
 
 If any answer is "I do not know", find out before the cut. A vote you cannot cast is a proposal that fails for lack of turnout, and the payout that never went to the correspondent who wrote the brief.
 
